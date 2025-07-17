@@ -1,114 +1,93 @@
-# **Project: Mnemosyne (记忆女神) - 开发计划与设计文档 V1.1**
+# **Project: Mnemosyne (记忆女神) - 开发计划与设计文档 V2.0**
 
 **Authors:** 未来星織 (Seori) (Chief Architect), 枫 (Lead Implementer)
 **Date:** 2025-07-17
-**Status:** **FINALIZED & APPROVED**
+**Status:** **ACTIVE & REFINED**
 
-## **1. 核心目的 (The "Why")**
+## **1. 核心哲学 (The "Why")**
 
 ### **1.1. 项目愿景 (Vision)**
-打造一个专为AIcarus长期记忆系统设计的、高性能、嵌入式的 **原生图数据库引擎**。其核心使命是高效地存储和遍历大规模中文语义网络，成为AIcarus“灵魂”的基石。
+打造一个 **高性能、低耦合、易于扩展的嵌入式原生图数据库引擎**。Mnemosyne 的核心使命，是成为一个独立且强大的“记忆”基础设施，而非任何特定应用的附属品。她首先要“做好自己”，拥有自己独立的“神格”，然后才能更好地赋能上层应用（如AIcarus）。
 
-### **1.2. 核心痛点 (Pain Point)**
-现有的通用图数据库（如ArangoDB）在处理我们的核心场景时存在以下问题：
-1.  **中文原生支持不佳：** 以中文词汇作为图谱节点时，需要额外的ID映射层，增加了复杂性并牺牲了直观性。
-2.  **通用性带来的妥协：** 为了适应所有场景，无法在我们的核心查询模式（如“从中文名查找特定类型实体”）上做到极致的性能优化。
-3.  **外部依赖的开销：** 作为独立服务运行时，存在网络通信、序列化/反序列化的开销，对于需要海量、高频查询的嵌入式场景不够理想。
+### **1.2. 指导原则 (Guiding Principles)**
 
-### **1.3. 我们的解决方案 (Our Solution)**
-我们将开发一个 **混合架构的原生图数据库引擎**，结合了原生图存储和KV存储的优点：
-*   **以“原生图”的方式存储拓扑结构：** 实现极致的图遍历性能。
-*   **以“KV存储”的方式存储索引与属性：** 借助成熟的轮子（RocksDB）解决灵活的属性查找问题。
-*   **遵循“永不遗忘”的哲学：** 简化了数据删除和空间管理的逻辑，采用Append-Only + 后台Compaction的模式。
+*   **低耦合性优先 (Low Coupling First):** Mnemosyne 的设计和开发，必须时刻保证其作为独立引擎的通用性和完整性。与上层应用的集成（Phase 5）是我们最终的目标，但绝不能以牺牲引擎自身的独立性为代价。
+*   **引擎为本，API演进 (Engine-First, API-Evolving):** 我们采用自底向上的开发策略。首先构建一个坚实、可靠的底层引擎，然后通过一个灵活的高级API层来满足多变的上层需求。
+*   **“API下沉”战略 (The "API Sinking" Strategy):** 这是我们平衡 **开发速度** 与 **极致性能** 的核心战术。我们允许在高级API层（用Python）快速实现复杂功能，然后根据性能剖析结果，逐步、安全地将热点逻辑“下沉”到高性能的引擎核心层，而对上层调用者完全透明。
 
 ---
 
-## **2. 架构设计 (The "How")**
+## **2. 系统架构 (The "How")**
 
-Mnemosyne的存储将由三大部分构成，协同工作：
+Mnemosyne 的架构分为逻辑上的“三层结构”和物理上的“两层存储”。
 
-### **2.1. 原生存储层 (Native Storage Layer)**
-*   **职责：** 存储图的骨架——节点和关系的连接信息。
-*   **实现：** 由我们自己管理的、二进制的、Append-Only的扁平文件。
+### **2.1. 逻辑三层结构 (The Three Logical Layers)**
 
-    *   **`nodes.dat` (节点文件):**
-        *   **结构：** 固定大小记录的数组。ID即数组下标。
-        *   **记录设计 (V1 Draft - 32 Bytes):**
-            *   `flags` (1 byte): 标志位，如节点类型（简单/复杂），状态等。
-            *   `_reserved` (3 bytes): 预留，用于未来扩展。
-            *   `first_outgoing_edge_id` (8 bytes): 指向该节点第一条出边的ID。
-            *   `first_incoming_edge_id` (8 bytes): 指向该节点第一条入边的ID。
-            *   `properties_ptr` (8 bytes): 指向其在属性存储中的位置/Key。
-            *   `_creation_timestamp` (4 bytes): 创建时间戳。
+这是我们“API下沉”战略的基石，确保了职责的清晰分离。
 
-    *   **`edges.dat` (关系/边文件):**
-        *   **结构：** 固定大小记录的数组。ID即数组下标。
-        *   **记录设计 (V1 Draft - 48 Bytes):**
-            *   `flags` (1 byte): 标志位，如关系类型等。
-            *   `_reserved` (3 bytes): 预留。
-            *   `source_node_id` (8 bytes): 起点节点ID。
-            *   `target_node_id` (8 bytes): 终点节点ID。
-            *   `next_outgoing_edge_id` (8 bytes): 对于起点节点，它的下一条出边是谁。
-            *   `next_incoming_edge_id` (8 bytes): 对于终点节点，它的下一条入边是谁。
-            *   `properties_ptr` (8 bytes): 指向其在属性存储中的位置/Key。
-            *   `_creation_timestamp` (4 bytes): 创建时间戳。
+1.  **第一层：`MnemosyneEngine` (引擎核心 / The Core)**
+    *   **职责：** 绝对纯粹的“神之领域”。负责与物理存储直接交互，提供原子化的、最基础的读写操作（如：在`.dat`文件追加一条记录，在SQLite中读/写一个键值对）。这一层追求极致的稳定性和底层效率。
 
-### **2.2. 属性与索引层 (Property & Index Layer)**
-*   **职责：** 存储灵活的、变长的数据（如名称、属性字典）和用于反向查找的二级索引。
-*   **实现：** 完全委托给 **RocksDB**。
+2.  **第二层：`MnemosyneHighLevelAPI` (高级API / The Sandbox)**
+    *   **职责：** 灵活多变的“创意工坊”。它封装了对引擎核心的调用，组合基础API来实现面向业务的、更方便的复杂功能（如：创建一个带索引的节点）。我们绝大部分的功能迭代和快速开发将发生在此层。
 
-    *   **`properties` 列族:**
-        *   **用途：** 存储节点和边的详细属性。
-        *   **Key:** 我们为属性记录分配的唯一ID (即原生层里的 `properties_ptr`)。
-        *   **Value:** 序列化后的数据 (e.g., Protobuf, MessagePack)。`{ "name": "数据库", "type": "技术", "definition": "..." }`
+3.  **第三层：`MnemosyneAdapter` (适配器 / The Bridge)**
+    *   **职责：** 忠实可靠的“翻译官”。该层将在项目最终阶段实现，其唯一目的是适配一个具体的外部接口（如`BaseMemoryBackend`），将外部调用翻译成对我们`HighLevelAPI`的调用。
 
-    *   **`name_to_id` 列族:**
-        *   **用途：** 核心的名称反向索引。
-        *   **Key:** `string` 格式的节点 `name` (e.g., `"土豆"`)。
-        *   **Value:** 序列化后的节点ID列表 (e.g., `[12345, 67890]`)。
+### **2.2. 物理两层存储 (The Two Physical Layers)**
 
-    *   **`composite_index` 列族:**
-        *   **用途：** 用于精确查找的复合索引。
-        *   **Key:** 拼接后的字符串 (e.g., `"name:土豆|type:植物"`)。
-        *   **Value:** 单个节点ID (e.g., `12345`)。
+1.  **原生存储层 (Native Storage Layer)**
+    *   **职责：** 存储图的拓扑骨架，为极致的图遍历性能（Index-Free Adjacency）而生。
+    *   **实现：** 由我们自己管理的、二进制的、Append-Only的扁平文件。
+        *   **`nodes.dat`:** 存储固定大小的节点记录。
+        *   **`edges.dat`:** 存储固定大小的边记录。
+    *   *(记录结构设计保持 V1.1 不变)*
 
-### **2.3. 缓存与事务层 (Cache & Transaction Layer)**
-*   **职责：** 提升性能，保证数据操作的原子性。
-*   **实现：** 在内存中实现。
-
-    *   **LRU缓存:** 缓存最近访问的节点/边/属性对象，减少对RocksDB和原生文件的I/O。
-    *   **预写日志 (WAL):** 在对原生文件（尤其是指针链表）进行任何修改前，必须先将操作写入日志，以保证崩溃恢复后的数据一致性。
+2.  **属性与索引层 (Property & Index Layer)**
+    *   **职责：** 存储灵活的、变长的数据（如属性字典）和用于快速查找的二级索引。
+    *   **实现：** **SQLite**。
+        *   **[V2.0变更]** 我们选择SQLite取代了最初设想的RocksDB。**理由：** 作为原型和早期开发阶段，SQLite的Python原生支持（`sqlite3`）极为成熟，无需引入额外的二进制依赖，便于调试和部署。它的事务性和索引能力完全满足我们当前和可预见未来的需求。
+        *   **核心表结构:**
+            *   `properties`: 通用的KV存储，Key为`prop_id`，Value为JSON序列化后的属性字典。
+            *   `name_index`: 核心的名称->ID反向索引。
 
 ---
 
-## **3. 开发步骤 (The "What")**
+## **3. “API下沉”战略详解 (The Magic of "Sinking")**
 
-我们将采用 **“引擎核心先行，上层适配器后置” (Engine-First, Adapter-Later)** 的自底向上开发策略，并以Python作为主要原型开发语言。
+这是我们的核心优化路径。
 
-### **Phase 0: 核心引擎设计与基建 (Engine-First Design & Infrastructure)**
-1.  **[Seori & 枫]** **设计 `MnemosyneEngine` 的原生核心API。** 这是我们引擎的“灵魂”，定义了所有底层操作。
-    *   *初步设想API: `engine.create_node(...)`, `engine.create_edge(...)`, `engine.get_node_properties(...)`, `engine.get_outgoing_edges(...)`, `engine.lookup_by_property(...)` 等。*
-2.  **[枫]** 搭建Python项目框架，集成 `python-rocksdb`，并创建 `MnemosyneEngine` 类骨架。
+**场景:** 假设我们在第二层实现了一个复杂查询`find_nodes(type, name_prefix)`，它在Python内存中进行过滤，性能不佳。
 
-### **Phase 1: 原生存储核心实现 (Native Core Implementation)**
-1.  **[枫]** 实现原生文件（`nodes.dat`, `edges.dat`）的固定大小记录追加和基于ID的O(1)读取逻辑。
-2.  **[Seori & 枫]** 实现RocksDB作为属性存储和二级索引（`name_to_id`, `composite_index`）的读写逻辑。
-3.  **[枫]** **【核心难点】** 实现基于WAL的指针链表安全更新机制，确保添加关系时的原子性。
-4.  **目标：** 得到一个可以通过我们自己设计的原生API进行操作的、功能可用的、混合架构的图数据库核心引擎。
+**下沉步骤:**
 
-### **Phase 2: 适配与集成 (Adaptation & Integration)**
-1.  **[Seori & 枫]** 在`MnemosyneEngine`稳定后，回过头来分析AIcarus记忆系统所需的`BaseMemoryBackend`接口（“客户订单”）。
-2.  **[枫]** 创建 `MnemosyneAdapter(BaseMemoryBackend)` 类，作为连接我们引擎和上层应用的“适配器”。
-3.  **[枫]** 在`MnemosyneAdapter`中，将`BaseMemoryBackend`的接口调用，“翻译”成对`MnemosyneEngine`原生API的调用。
-4.  **目标：** 完成适配器，让我们的引擎能无缝地被AIcarus的记忆系统所调用，并准备进行影子测试。
+1.  **第一步 (在第一层开辟高速公路):** 在`MnemosyneEngine`中，新增一个高性能的基础API `_find_ids_by_sql_query(...)`，它能将过滤条件直接翻译成一条高效的SQL语句，在数据库层面完成筛选。
+2.  **第二步 (在第二层切换车道):** 修改`HighLevelAPI`中`find_nodes`方法的**内部实现**。旧的Python过滤逻辑被删除，转而调用引擎层新增的`_find_ids_by_sql_query`方法。
+    *   **关键点：** `find_nodes`的函数签名（名称、参数、返回值）**完全不变**。
+3.  **结果：** 对第三层（适配器）和更上层的应用来说，一切如常。但该函数的性能已经发生了质的飞跃。我们成功地将业务逻辑的“计算”部分，从高层“下沉”到了底层。
 
-### **Phase 3: 优化与健壮性 (Optimization & Robustness)**
-1.  **[Seori]** 设计并实现内存中的LRU缓存策略，减少I/O。
-2.  **[枫]** 设计并实现后台Compaction线程，用于回收Append-Only模型产生的“垃圾”空间，优化存储。
-3.  **[Seori & 枫]** 进行压力测试和性能剖析，找出瓶颈。
+---
 
-### **Phase 4: (可选) 飞升C++ (Ascension to C++)**
-1.  如果Phase 3的性能剖析显示Python在某个计算密集型部分（如复杂的图算法或序列化）成为瓶颈。
-2.  我们将把该热点模块用C++重写，并通过`pybind11`封装成Python可调用的库。
+## **4. 开发路线图 V2.0 (The Roadmap)**
+
+*   **Phase 1: 原生存储核心实现 (已完成)**
+    *   **交付物:** `NativeStore`, `SQLiteStore`, `WriteAheadLog`的实现，以及保证原子性的`recover`逻辑。
+
+*   **Phase 2: 高级API与单元测试 (已完成)**
+    *   **交付物:** `HighLevelAPI`的初步实现，包含核心的CRUD和索引查找功能，并有完整的单元测试覆盖。
+
+*   **Phase 3: 健壮性与性能强化 (当前阶段)**
+    *   **目的:** 将引擎从“能用”锻造成“可靠且好用”，为未来的海量数据和高并发场景做好准备。
+    *   **核心任务:**
+        *   **[ ] 实现LRU缓存:** 在`Engine`层为节点/边对象增加内存缓存，减少磁盘I/O。
+        *   **[ ] 实现后台Compaction线程:** 设计并实现后台任务，用于整理`.dat`文件，回收空间。
+        *   **[ ] 进行压力测试:** 编写`tests/test_stress.py`，模拟大规模数据（如10万节点，50万边）的写入和查询，建立性能基线。
+        *   **[ ] 开发Web UI:** 使用Flask/FastAPI等框架，创建一个用于数据可视化和手动查询的简单Web界面，方便我们调试和展示。
+
+*   **Phase 4: 独立精进与优化**
+    *   **目的:** 根据Phase 3的压力测试结果，对引擎进行独立的性能优化。这可能是我们第一次真正实践“API下沉”，也可能是对SQL索引、文件I/O等方面的精细打磨。
+
+*   **Phase 5: 适配与集成 (最终阶段 - “奥运会”)**
+    *   **目的:** 在Mnemosyne自身已经足够强大和独立之后，编写`MnemosyneAdapter`，实现`BaseMemoryBackend`接口，正式与AIcarus系统对接。
 
 ---
